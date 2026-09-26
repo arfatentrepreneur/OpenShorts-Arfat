@@ -1,0 +1,68 @@
+"""Async SQLAlchemy engine + session management for cloud mode."""
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import declarative_base
+
+from .config import settings
+
+Base = declarative_base()
+
+_engine = None
+_sessionmaker = None
+
+# Columns added to tables that already exist in production. ADD COLUMN IF NOT
+# EXISTS is a no-op on a database that already has them and on a fresh one that
+# create_all just built.
+_ADDITIVE_COLUMNS = (
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+    "marketing_opt_out BOOLEAN NOT NULL DEFAULT false",
+    # Nullable, no default: a catalog-only change, no table rewrite.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS free_plan_denied VARCHAR(32)",
+)
+
+
+async def init_engine():
+    """Create the async engine + sessionmaker and ensure the schema exists.
+
+    Uses ``create_all`` for zero-friction boot (additive-only schema in v1).
+    Alembic (see ``alembic/``) is available for controlled migrations later.
+    """
+    global _engine, _sessionmaker
+    if _engine is not None:
+        return
+    # Import models so their tables register on Base.metadata before create_all.
+    from . import models  # noqa: F401
+
+    _engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
+
+    async with _engine.begin() as conn:
+        # Case-insensitive email uniqueness.
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext"))
+        await conn.run_sync(Base.metadata.create_all)
+        # create_all creates missing TABLES and never ALTERs an existing one, so
+        # a column added to a model that already shipped exists in the code and
+        # not in the database. Each statement here is additive and idempotent;
+        # keep them that way, and prefer Alembic once one of them is not.
+        for statement in _ADDITIVE_COLUMNS:
+            try:
+                await conn.execute(text(statement))
+            except Exception as e:  # pragma: no cover - depends on the server
+                print(f"⚠️  Additive schema step failed ({statement}): {e}")
+
+
+def get_sessionmaker():
+    if _sessionmaker is None:
+        raise RuntimeError("Cloud DB engine not initialized — call init_engine() first.")
+    return _sessionmaker
+
+
+def session():
+    """Return a new AsyncSession context manager (for use outside FastAPI deps)."""
+    return get_sessionmaker()()
+
+
+async def get_db():
+    """FastAPI dependency yielding an AsyncSession."""
+    async with get_sessionmaker()() as s:
+        yield s
